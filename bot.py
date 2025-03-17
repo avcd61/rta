@@ -1,405 +1,534 @@
-import os
-import asyncio
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
-import youtube_dl
+import asyncio
+import os
 from datetime import datetime
-import random
-from collections import deque
+import wavelink
+from typing import Optional
 
 # Загрузка переменных окружения из .env файла
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 
-# Настройки youtube_dl
-ytdl_format_options = {
-    'format': 'bestaudio/best',
-    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
-    'restrictfilenames': True,
-    'noplaylist': True,
-    'nocheckcertificate': True,
-    'ignoreerrors': False,
-    'logtostderr': False,
-    'quiet': True,
-    'no_warnings': True,
-    'default_search': 'auto',
-    'source_address': '0.0.0.0',
-}
-
-ffmpeg_options = {
-    'options': '-vn',
-}
-
-ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
-
-class MusicQueue:
-    def __init__(self):
-        self.queue = deque()
-        self.current = None
-        self.loop = False
-        self.volume = 0.5
-
-    def add(self, track):
-        self.queue.append(track)
-        return len(self.queue) - 1
-
-    def next(self):
-        if self.loop:
-            return self.current
-        if self.queue:
-            self.current = self.queue.popleft()
-            return self.current
-        return None
-
-    def shuffle(self):
-        random.shuffle(self.queue)
-
-    def clear(self):
-        self.queue.clear()
-        self.current = None
-
-class YTDLSource(discord.PCMVolumeTransformer):
-    def __init__(self, source, *, data, volume=0.5):
-        super().__init__(source, volume)
-        self.data = data
-        self.title = data.get('title')
-        self.url = data.get('url')
-        self.duration = data.get('duration')
-        self.thumbnail = data.get('thumbnail')
-        self.uploader = data.get('uploader')
-
-    @classmethod
-    async def from_url(cls, url, *, loop=None, stream=False):
-        loop = loop or asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
-
-        if 'entries' in data:
-            data = data['entries'][0]
-
-        filename = data['url'] if stream else ytdl.prepare_filename(data)
-        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+# Настройка логирования
+def log_error(error_message):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    error_log = f"[ERROR] {timestamp}: {error_message}"
+    print(error_log)
 
 # Создание экземпляра бота
 intents = discord.Intents.default()
 intents.message_content = True
+intents.voice_states = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+# Класс для управления очередью треков
+class MusicQueue:
+    def __init__(self):
+        self.queue = []
+        self.current = None
+        self.loop = False
+        self.volume = 50  # 0-100
+
+    async def add(self, track):
+        """Добавить трек в очередь"""
+        position = len(self.queue)
+        self.queue.append(track)
+        return position
+
+    async def next(self):
+        """Получить следующий трек из очереди"""
+        if not self.queue:
+            return None
+            
+        # Если включен режим повтора, возвращаем текущий трек
+        if self.loop and self.current:
+            return self.current
+            
+        # Иначе берем следующий трек из очереди
+        track = self.queue.pop(0)
+        self.current = track
+        return track
+
+    async def clear(self):
+        """Очистить очередь"""
+        self.queue.clear()
+        self.current = None
+
+    def get_queue_list(self):
+        """Получить список треков в очереди"""
+        return self.queue
+
 # Словарь для хранения очередей для каждого сервера
-music_queues = {}
+queues = {}
 
+# Получение очереди для сервера
 def get_queue(guild_id):
-    if guild_id not in music_queues:
-        music_queues[guild_id] = MusicQueue()
-    return music_queues[guild_id]
+    if guild_id not in queues:
+        queues[guild_id] = MusicQueue()
+    return queues[guild_id]
 
+# Создание embed-сообщений
 def create_music_embed(title, description, color=discord.Color.blue(), thumbnail=None):
-    embed = discord.Embed(
-        title=title,
-        description=description,
-        color=color,
-        timestamp=datetime.utcnow()
-    )
+    embed = discord.Embed(title=title, description=description, color=color)
     if thumbnail:
         embed.set_thumbnail(url=thumbnail)
-    embed.set_footer(text="Музыкальный бот")
+    embed.set_footer(text=f"Музыкальный бот • {datetime.now().strftime('%H:%M:%S')}")
     return embed
 
+# Проверка и отключение от пустого голосового канала
 async def check_empty_voice_channel(guild):
-    if guild.voice_client and guild.voice_client.is_connected():
-        if len(guild.voice_client.channel.members) <= 1:
-            await asyncio.sleep(300)  # Ждем 5 минут
-            if len(guild.voice_client.channel.members) <= 1:
+    try:
+        if guild.voice_client and guild.voice_client.is_connected():
+            members = guild.voice_client.channel.members
+            # Если в канале только бот или вообще никого
+            if len(members) <= 1:
                 await guild.voice_client.disconnect()
                 queue = get_queue(guild.id)
-                queue.clear()
-                channel = guild.text_channels[0]  # Отправляем сообщение в первый текстовый канал
-                embed = create_music_embed(
-                    "👋 Отключение",
-                    "Бот отключен из-за отсутствия слушателей",
-                    color=discord.Color.red()
-                )
-                await channel.send(embed=embed)
+                await queue.clear()
+    except Exception as e:
+        log_error(f"Ошибка при проверке пустого канала: {e}")
 
+# Событие готовности бота
 @bot.event
 async def on_ready():
-    print(f'{bot.user.name} подключился к Discord!')
-    print(f'ID бота: {bot.user.id}')
+    print(f'Бот {bot.user} готов к работе!')
     print('------')
+    try:
+        print("Начинаю синхронизацию команд...")
+        synced = await bot.tree.sync()
+        print(f"Синхронизировано {len(synced)} команд:")
+        for cmd in synced:
+            print(f"  • /{cmd.name}")
+    except Exception as e:
+        print(f"Ошибка при синхронизации команд: {e}")
     
-    # Установка статуса бота
+    # Запускаем проверку пустых каналов
+    check_empty_channels.start()
+    
+    # Установка статуса
     await bot.change_presence(
         activity=discord.Activity(
-            type=discord.ActivityType.listening,
-            name="музыку | /play"
+            type=discord.ActivityType.listening, 
+            name="/play"
         )
     )
     
-    # Синхронизация слэш-команд
-    try:
-        synced = await bot.tree.sync()
-        print(f"Синхронизировано {len(synced)} команд")
-    except Exception as e:
-        print(f"Ошибка синхронизации команд: {e}")
+    # Подключение к узлам Lavalink
+    # Используем несколько публичных серверов для надежности
+    nodes = [
+        wavelink.Node(
+            uri='lavalink.oops.wtf:443',
+            password='www.freelavalink.ga',
+            secure=True
+        ),
+        wavelink.Node(
+            uri='lava.link:80',
+            password='anything as a password',
+            secure=False
+        ),
+        wavelink.Node(
+            uri='lavalinkinc.ml:443',
+            password='incognito',
+            secure=True
+        )
+    ]
+    
+    # Пробуем подключиться к узлам, используя несколько попыток
+    retry_count = 0
+    max_retries = 3
+    
+    while retry_count < max_retries:
+        try:
+            print(f"Попытка подключения к Lavalink (попытка {retry_count + 1})...")
+            await wavelink.Pool.connect(nodes=nodes, client=bot)
+            print(f"Успешно подключен к серверу Lavalink!")
+            break
+        except Exception as e:
+            log_error(f"Ошибка подключения к Lavalink: {e}")
+            retry_count += 1
+            if retry_count < max_retries:
+                print(f"Повторная попытка через 5 секунд...")
+                await asyncio.sleep(5)
+            else:
+                print("Не удалось подключиться к Lavalink после нескольких попыток.")
 
+# Проверяет и отключается от пустых голосовых каналов
+@tasks.loop(minutes=5)
+async def check_empty_channels():
+    for guild in bot.guilds:
+        await check_empty_voice_channel(guild)
+
+# Обработка события окончания трека
+@bot.event
+async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
+    player = payload.player
+    guild = player.guild
+    
+    if not guild:
+        return
+        
+    try:
+        queue = get_queue(guild.id)
+        next_track = await queue.next()
+        
+        if next_track:
+            # Воспроизводим следующий трек из очереди
+            await player.play(next_track, volume=queue.volume)
+            
+            # Находим текстовый канал для отправки уведомления
+            channel = None
+            for ch in guild.text_channels:
+                if ch.permissions_for(guild.me).send_messages:
+                    channel = ch
+                    break
+            
+            if channel:
+                embed = create_music_embed(
+                    "🎵 Следующий трек",
+                    f"**{next_track.title}**\n"
+                    f"👤 Исполнитель: {next_track.author}\n"
+                    f"⏱️ Длительность: {int(next_track.length // 60000)}:{int((next_track.length % 60000) // 1000):02d}",
+                    thumbnail=next_track.artwork
+                )
+                await channel.send(embed=embed)
+        else:
+            # Очередь пуста
+            queue.current = None
+            await check_empty_voice_channel(guild)
+    except Exception as e:
+        log_error(f"Ошибка при обработке конца трека: {str(e)}")
+
+# Команда для воспроизведения музыки
 @bot.tree.command(name="play", description="Проигрывание музыки из YouTube")
-async def play(interaction: discord.Interaction, url: str):
+async def play(interaction: discord.Interaction, запрос: str):
     if not interaction.user.voice:
         await interaction.response.send_message(
-            '❌ Вы должны быть в голосовом канале, чтобы использовать эту команду!',
+            embed=create_music_embed(
+                "❌ Ошибка",
+                "Вы должны быть в голосовом канале!",
+                color=discord.Color.red()
+            ),
             ephemeral=True
         )
         return
 
-    channel = interaction.user.voice.channel
-    
-    if interaction.guild.voice_client is None:
-        await channel.connect()
-    elif interaction.guild.voice_client.channel != channel:
-        await interaction.guild.voice_client.move_to(channel)
-    
+    # Отложенный ответ, так как поиск может занять время
     await interaction.response.defer()
     
     try:
-        player = await YTDLSource.from_url(url, loop=bot.loop, stream=True)
+        # Подключение к голосовому каналу
+        if not interaction.guild.voice_client:
+            player = await interaction.user.voice.channel.connect(cls=wavelink.Player)
+        else:
+            player = interaction.guild.voice_client
+            
+            # Перемещаемся в канал пользователя, если бот в другом канале
+            if player.channel != interaction.user.voice.channel:
+                await player.move_to(interaction.user.voice.channel)
+        
+        # Получение очереди
         queue = get_queue(interaction.guild_id)
         
-        if not interaction.guild.voice_client.is_playing():
-            interaction.guild.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(
-                check_song_end(interaction.guild), bot.loop
-            ))
-            queue.current = player
+        # Поиск трека
+        tracks = await wavelink.Playable.search(запрос)
+        if not tracks:
+            await interaction.followup.send(
+                embed=create_music_embed(
+                    "❌ Ошибка",
+                    "Не удалось найти треки по вашему запросу",
+                    color=discord.Color.red()
+                )
+            )
+            return
+            
+        track = tracks[0]  # Берем первый найденный трек
+        
+        if not player.playing:
+            # Начинаем воспроизведение если ничего не играет
+            await player.play(track, volume=queue.volume)
+            queue.current = track
             
             embed = create_music_embed(
                 "🎵 Сейчас играет",
-                f"**{player.title}**\n"
-                f"👤 Исполнитель: {player.uploader}\n"
-                f"⏱️ Длительность: {player.duration//60}:{player.duration%60:02d}",
-                thumbnail=player.thumbnail
+                f"**{track.title}**\n"
+                f"👤 Исполнитель: {track.author}\n"
+                f"⏱️ Длительность: {int(track.length // 60000)}:{int((track.length % 60000) // 1000):02d}",
+                thumbnail=track.artwork
             )
             await interaction.followup.send(embed=embed)
         else:
-            position = queue.add(player)
+            # Добавляем в очередь если уже что-то играет
+            position = await queue.add(track)
             embed = create_music_embed(
                 "📝 Добавлено в очередь",
-                f"**{player.title}**\n"
-                f"👤 Исполнитель: {player.uploader}\n"
-                f"⏱️ Длительность: {player.duration//60}:{player.duration%60:02d}\n"
+                f"**{track.title}**\n"
+                f"👤 Исполнитель: {track.author}\n"
+                f"⏱️ Длительность: {int(track.length // 60000)}:{int((track.length % 60000) // 1000):02d}\n"
                 f"📊 Позиция в очереди: {position + 1}",
-                thumbnail=player.thumbnail
+                thumbnail=track.artwork
             )
             await interaction.followup.send(embed=embed)
             
     except Exception as e:
-        error_embed = create_music_embed(
-            "❌ Ошибка",
-            f"Произошла ошибка при воспроизведении:\n{str(e)}",
-            color=discord.Color.red()
-        )
-        await interaction.followup.send(embed=error_embed)
-
-async def check_song_end(guild):
-    queue = get_queue(guild.id)
-    if queue.current:
-        next_song = queue.next()
-        if next_song:
-            guild.voice_client.play(next_song, after=lambda e: asyncio.run_coroutine_threadsafe(
-                check_song_end(guild), bot.loop
-            ))
-            queue.current = next_song
-            channel = guild.text_channels[0]
-            embed = create_music_embed(
-                "🎵 Следующий трек",
-                f"**{next_song.title}**\n"
-                f"👤 Исполнитель: {next_song.uploader}\n"
-                f"⏱️ Длительность: {next_song.duration//60}:{next_song.duration%60:02d}",
-                thumbnail=next_song.thumbnail
+        log_error(f"Ошибка при воспроизведении: {str(e)}")
+        await interaction.followup.send(
+            embed=create_music_embed(
+                "❌ Ошибка воспроизведения",
+                f"```{str(e)}```\nПопробуйте другой запрос или повторите позже.",
+                color=discord.Color.red()
             )
-            await channel.send(embed=embed)
-        else:
-            queue.current = None
-            await asyncio.sleep(1)
-            await check_empty_voice_channel(guild)
-
-@bot.tree.command(name="queue", description="Показать текущую очередь воспроизведения")
-async def queue(interaction: discord.Interaction):
-    queue = get_queue(interaction.guild_id)
-    
-    if not queue.current and not queue.queue:
-        embed = create_music_embed(
-            "📋 Очередь пуста",
-            "Нет треков в очереди",
-            color=discord.Color.red()
         )
-        await interaction.response.send_message(embed=embed)
+
+# Команда для паузы
+@bot.tree.command(name="pause", description="Приостановить воспроизведение")
+async def pause(interaction: discord.Interaction):
+    if not interaction.guild.voice_client or not hasattr(interaction.guild.voice_client, 'playing'):
+        await interaction.response.send_message(
+            embed=create_music_embed(
+                "❌ Ошибка",
+                "Сейчас ничего не воспроизводится!",
+                color=discord.Color.red()
+            ),
+            ephemeral=True
+        )
+        return
+        
+    player = interaction.guild.voice_client
+    
+    if not player.playing:
+        await interaction.response.send_message(
+            embed=create_music_embed(
+                "❌ Ошибка",
+                "Сейчас ничего не воспроизводится!",
+                color=discord.Color.red()
+            ),
+            ephemeral=True
+        )
         return
     
-    description = ""
-    if queue.current:
-        description += f"**Сейчас играет:**\n"
-        description += f"🎵 {queue.current.title}\n"
-        description += f"👤 {queue.current.uploader}\n\n"
+    await player.pause()
     
-    if queue.queue:
-        description += "**Очередь:**\n"
-        for i, track in enumerate(queue.queue, 1):
-            description += f"{i}. {track.title} - {track.uploader}\n"
-    
-    embed = create_music_embed(
-        "📋 Очередь воспроизведения",
-        description,
-        color=discord.Color.blue()
+    await interaction.response.send_message(
+        embed=create_music_embed(
+            "⏸️ Пауза",
+            "Воспроизведение приостановлено. Используйте `/resume` для продолжения."
+        )
     )
-    await interaction.response.send_message(embed=embed)
 
+# Команда для возобновления
+@bot.tree.command(name="resume", description="Возобновить воспроизведение")
+async def resume(interaction: discord.Interaction):
+    if not interaction.guild.voice_client or not hasattr(interaction.guild.voice_client, 'playing'):
+        await interaction.response.send_message(
+            embed=create_music_embed(
+                "❌ Ошибка",
+                "Бот не подключен к голосовому каналу!",
+                color=discord.Color.red()
+            ),
+            ephemeral=True
+        )
+        return
+    
+    player = interaction.guild.voice_client
+    
+    if not player.paused:
+        await interaction.response.send_message(
+            embed=create_music_embed(
+                "❌ Ошибка",
+                "Воспроизведение не приостановлено!",
+                color=discord.Color.red()
+            ),
+            ephemeral=True
+        )
+        return
+    
+    await player.resume()
+    
+    await interaction.response.send_message(
+        embed=create_music_embed(
+            "▶️ Возобновление",
+            "Воспроизведение возобновлено."
+        )
+    )
+
+# Команда для пропуска трека
 @bot.tree.command(name="skip", description="Пропустить текущий трек")
 async def skip(interaction: discord.Interaction):
-    if not interaction.guild.voice_client or not interaction.guild.voice_client.is_playing():
-        embed = create_music_embed(
-            "❌ Ошибка",
-            "Сейчас ничего не играет",
-            color=discord.Color.red()
+    if not interaction.guild.voice_client or not hasattr(interaction.guild.voice_client, 'playing'):
+        await interaction.response.send_message(
+            embed=create_music_embed(
+                "❌ Ошибка",
+                "Сейчас ничего не воспроизводится!",
+                color=discord.Color.red()
+            ),
+            ephemeral=True
         )
-        await interaction.response.send_message(embed=embed)
         return
     
-    interaction.guild.voice_client.stop()
-    embed = create_music_embed(
-        "⏭️ Пропуск",
-        "Трек пропущен",
-        color=discord.Color.orange()
+    player = interaction.guild.voice_client
+    
+    if not player.playing:
+        await interaction.response.send_message(
+            embed=create_music_embed(
+                "❌ Ошибка",
+                "Сейчас ничего не воспроизводится!",
+                color=discord.Color.red()
+            ),
+            ephemeral=True
+        )
+        return
+    
+    queue = get_queue(interaction.guild_id)
+    current_track = queue.current
+    
+    # Пропускаем текущий трек
+    await player.stop()
+    
+    await interaction.response.send_message(
+        embed=create_music_embed(
+            "⏭️ Пропуск",
+            f"Трек **{current_track.title if current_track else 'Неизвестный'}** пропущен."
+        )
     )
-    await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="shuffle", description="Перемешать очередь")
-async def shuffle(interaction: discord.Interaction):
+# Команда для отображения очереди
+@bot.tree.command(name="queue", description="Показать текущую очередь воспроизведения")
+async def queue_command(interaction: discord.Interaction):
+    queue = get_queue(interaction.guild_id)
+    queue_list = queue.get_queue_list()
+    
+    if not queue.current and not queue_list:
+        await interaction.response.send_message(
+            embed=create_music_embed(
+                "📝 Очередь",
+                "Очередь пуста. Добавьте треки с помощью команды `/play`"
+            )
+        )
+        return
+    
+    # Формируем описание с текущим треком и очередью
+    description = ""
+    
+    if queue.current:
+        description += f"**🔊 Сейчас играет:**\n{queue.current.title} - {queue.current.author}\n\n"
+        
+    if queue_list:
+        description += "**📋 В очереди:**\n"
+        for i, track in enumerate(queue_list[:10]):
+            description += f"{i+1}. {track.title} - {track.author}\n"
+            
+        if len(queue_list) > 10:
+            description += f"\n...и еще {len(queue_list) - 10} треков"
+    else:
+        description += "\n**Очередь пуста**"
+        
+    await interaction.response.send_message(
+        embed=create_music_embed(
+            "📝 Очередь воспроизведения",
+            description
+        )
+    )
+
+# Команда для очистки очереди
+@bot.tree.command(name="clear", description="Очистить очередь воспроизведения")
+async def clear(interaction: discord.Interaction):
     queue = get_queue(interaction.guild_id)
     
-    if not queue.queue:
-        embed = create_music_embed(
-            "❌ Ошибка",
-            "Очередь пуста",
-            color=discord.Color.red()
+    if not queue.get_queue_list() and not queue.current:
+        await interaction.response.send_message(
+            embed=create_music_embed(
+                "❌ Ошибка",
+                "Очередь уже пуста!",
+                color=discord.Color.red()
+            ),
+            ephemeral=True
         )
-        await interaction.response.send_message(embed=embed)
         return
+        
+    await queue.clear()
     
-    queue.shuffle()
-    embed = create_music_embed(
-        "🔀 Перемешивание",
-        "Очередь перемешана",
-        color=discord.Color.green()
+    if interaction.guild.voice_client and hasattr(interaction.guild.voice_client, 'playing'):
+        await interaction.guild.voice_client.stop()
+        
+    await interaction.response.send_message(
+        embed=create_music_embed(
+            "🧹 Очистка",
+            "Очередь воспроизведения очищена."
+        )
     )
-    await interaction.response.send_message(embed=embed)
 
+# Команда для изменения громкости
+@bot.tree.command(name="volume", description="Изменить громкость воспроизведения (0-100)")
+async def volume(interaction: discord.Interaction, громкость: int):
+    if громкость < 0 or громкость > 100:
+        await interaction.response.send_message(
+            embed=create_music_embed(
+                "❌ Ошибка",
+                "Громкость должна быть от 0 до 100!",
+                color=discord.Color.red()
+            ),
+            ephemeral=True
+        )
+        return
+        
+    queue = get_queue(interaction.guild_id)
+    queue.volume = громкость
+    
+    if interaction.guild.voice_client and hasattr(interaction.guild.voice_client, 'playing'):
+        player = interaction.guild.voice_client
+        await player.set_volume(громкость)
+        
+    await interaction.response.send_message(
+        embed=create_music_embed(
+            "🔊 Громкость",
+            f"Громкость установлена на {громкость}%"
+        )
+    )
+
+# Команда для включения/выключения режима повтора
 @bot.tree.command(name="loop", description="Включить/выключить повтор текущего трека")
 async def loop(interaction: discord.Interaction):
     queue = get_queue(interaction.guild_id)
     queue.loop = not queue.loop
     
     status = "включен" if queue.loop else "выключен"
-    embed = create_music_embed(
-        "🔁 Режим повтора",
-        f"Повтор текущего трека {status}",
-        color=discord.Color.blue()
+    
+    await interaction.response.send_message(
+        embed=create_music_embed(
+            "🔄 Режим повтора",
+            f"Режим повтора {status}"
+        )
     )
-    await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="clear", description="Очистить очередь")
-async def clear(interaction: discord.Interaction):
+# Команда для отключения от голосового канала
+@bot.tree.command(name="disconnect", description="Отключиться от голосового канала")
+async def disconnect(interaction: discord.Interaction):
+    if not interaction.guild.voice_client:
+        await interaction.response.send_message(
+            embed=create_music_embed(
+                "❌ Ошибка",
+                "Бот не подключен к голосовому каналу!",
+                color=discord.Color.red()
+            ),
+            ephemeral=True
+        )
+        return
+    
+    # Очищаем очередь и отключаемся
     queue = get_queue(interaction.guild_id)
-    queue.clear()
+    await queue.clear()
     
-    embed = create_music_embed(
-        "🗑️ Очистка",
-        "Очередь очищена",
-        color=discord.Color.orange()
+    await interaction.guild.voice_client.disconnect()
+    
+    await interaction.response.send_message(
+        embed=create_music_embed(
+            "👋 Отключение",
+            "Бот отключен от голосового канала."
+        )
     )
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="pause", description="Приостановить проигрывание")
-async def pause(interaction: discord.Interaction):
-    if interaction.guild.voice_client and interaction.guild.voice_client.is_playing():
-        interaction.guild.voice_client.pause()
-        embed = create_music_embed(
-            "⏸️ Пауза",
-            "Воспроизведение приостановлено",
-            color=discord.Color.orange()
-        )
-        await interaction.response.send_message(embed=embed)
-    else:
-        embed = create_music_embed(
-            "❌ Ошибка",
-            "Нет проигрываемой музыки для паузы",
-            color=discord.Color.red()
-        )
-        await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="resume", description="Возобновить проигрывание")
-async def resume(interaction: discord.Interaction):
-    if interaction.guild.voice_client and interaction.guild.voice_client.is_paused():
-        interaction.guild.voice_client.resume()
-        embed = create_music_embed(
-            "▶️ Воспроизведение",
-            "Воспроизведение возобновлено",
-            color=discord.Color.green()
-        )
-        await interaction.response.send_message(embed=embed)
-    else:
-        embed = create_music_embed(
-            "❌ Ошибка",
-            "Музыка не на паузе",
-            color=discord.Color.red()
-        )
-        await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="stop", description="Остановить проигрывание и выйти из канала")
-async def stop(interaction: discord.Interaction):
-    if interaction.guild.voice_client:
-        queue = get_queue(interaction.guild_id)
-        queue.clear()
-        await interaction.guild.voice_client.disconnect()
-        embed = create_music_embed(
-            "⏹️ Остановка",
-            "Воспроизведение остановлено и бот отключен от канала",
-            color=discord.Color.red()
-        )
-        await interaction.response.send_message(embed=embed)
-    else:
-        embed = create_music_embed(
-            "❌ Ошибка",
-            "Бот не подключен к голосовому каналу",
-            color=discord.Color.red()
-        )
-        await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="volume", description="Регулировать громкость (0-100)")
-async def volume(interaction: discord.Interaction, volume: int):
-    if interaction.guild.voice_client is None:
-        embed = create_music_embed(
-            "❌ Ошибка",
-            "Бот не подключен к голосовому каналу",
-            color=discord.Color.red()
-        )
-        return await interaction.response.send_message(embed=embed)
-    
-    volume = max(0, min(100, volume))
-    interaction.guild.voice_client.source.volume = volume / 100
-    queue = get_queue(interaction.guild_id)
-    queue.volume = volume / 100
-    
-    # Создаем визуальный индикатор громкости
-    bar_length = 20
-    filled = int(volume * bar_length // 100)
-    bar = "█" * filled + "░" * (bar_length - filled)
-    
-    embed = create_music_embed(
-        "🔊 Громкость",
-        f"Установлена громкость: {volume}%\n{bar}",
-        color=discord.Color.blue()
-    )
-    await interaction.response.send_message(embed=embed)
 
 # Запуск бота
 bot.run(TOKEN) 
