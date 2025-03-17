@@ -15,7 +15,7 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 
 # Настройки yt-dlp
 ytdl_format_options = {
-    'format': 'bestaudio/best',
+    'format': 'bestaudio',
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
     'restrictfilenames': True,
     'noplaylist': True,
@@ -31,8 +31,8 @@ ytdl_format_options = {
 }
 
 ffmpeg_options = {
-    'options': '-vn -b:a 128k -loglevel error -hide_banner',
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin -y'
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn'
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
@@ -92,7 +92,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
         super().__init__(source, volume)
         self.data = data
         self.title = data.get('title', 'Неизвестное название')
-        self.url = data.get('url', '')
+        self.url = data.get('webpage_url', '')
         self.duration = data.get('duration', 0)
         self.thumbnail = data.get('thumbnail', '')
         self.uploader = data.get('uploader', 'Неизвестный исполнитель')
@@ -108,18 +108,27 @@ class YTDLSource(discord.PCMVolumeTransformer):
             # Получаем информацию о видео
             try:
                 data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+                if not data:
+                    raise Exception("Не удалось получить данные о видео")
+                
+                if 'entries' in data:
+                    data = data['entries'][0]
+
+                # Получаем прямую ссылку на аудио
+                if stream:
+                    processed_data = await loop.run_in_executor(None, lambda: ytdl.extract_info(data['webpage_url'], download=False))
+                    if not processed_data:
+                        raise Exception("Не удалось получить аудиопоток")
+                    data = processed_data
+
             except Exception as e:
                 log_error(f"Ошибка при получении информации о видео: {str(e)}")
                 raise Exception(f"Не удалось получить информацию о видео: {str(e)}")
 
-            if 'entries' in data:
-                # Плейлист - берем первое видео
-                data = data['entries'][0]
-
-            if not data:
-                raise Exception("Не удалось получить данные о видео")
-
-            filename = data['url'] if stream else ytdl.prepare_filename(data)
+            if stream:
+                filename = data['url']
+            else:
+                filename = ytdl.prepare_filename(data)
             
             try:
                 source = discord.FFmpegPCMAudio(filename, **ffmpeg_options)
@@ -220,6 +229,21 @@ async def on_ready():
     except Exception as e:
         print(f"Ошибка синхронизации команд: {e}")
 
+async def safe_play(voice_client, player, after_callback):
+    """Безопасное воспроизведение с предварительной остановкой."""
+    try:
+        if voice_client.is_playing():
+            voice_client.stop()
+            await asyncio.sleep(1)  # Увеличиваем время ожидания
+        
+        if not voice_client.is_connected():
+            raise Exception("Бот не подключен к голосовому каналу")
+            
+        voice_client.play(player, after=after_callback)
+    except Exception as e:
+        log_error(f"Ошибка при воспроизведении: {str(e)}")
+        raise e
+
 @bot.tree.command(name="play", description="Проигрывание музыки из YouTube")
 async def play(interaction: discord.Interaction, url: str):
     if not interaction.user.voice:
@@ -233,35 +257,27 @@ async def play(interaction: discord.Interaction, url: str):
         )
         return
 
-    channel = interaction.user.voice.channel
-    
-    try:
-        if interaction.guild.voice_client is None:
-            await channel.connect()
-        elif interaction.guild.voice_client.channel != channel:
-            await interaction.guild.voice_client.move_to(channel)
-    except Exception as e:
-        log_error(f"Ошибка при подключении к каналу: {str(e)}")
-        await interaction.response.send_message(
-            embed=create_music_embed(
-                "❌ Ошибка",
-                f"Не удалось подключиться к голосовому каналу: {str(e)}",
-                color=discord.Color.red()
-            ),
-            ephemeral=True
-        )
-        return
-    
     await interaction.response.defer()
     
     try:
+        # Подключение к голосовому каналу
+        if not interaction.guild.voice_client:
+            voice_client = await interaction.user.voice.channel.connect()
+        else:
+            voice_client = interaction.guild.voice_client
+            if voice_client.channel != interaction.user.voice.channel:
+                await voice_client.move_to(interaction.user.voice.channel)
+        
+        # Получение плеера
         player = await YTDLSource.from_url(url, loop=bot.loop, stream=True)
         queue = get_queue(interaction.guild_id)
         
-        if not interaction.guild.voice_client.is_playing():
-            interaction.guild.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(
-                check_song_end(interaction.guild), bot.loop
-            ))
+        if not voice_client.is_playing():
+            await safe_play(
+                voice_client, 
+                player, 
+                lambda e: asyncio.run_coroutine_threadsafe(check_song_end(interaction.guild), bot.loop)
+            )
             queue.current = player
             
             embed = create_music_embed(
