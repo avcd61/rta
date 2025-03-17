@@ -27,7 +27,7 @@ ytdl_format_options = {
     'default_search': 'auto',
     'source_address': '0.0.0.0',
     'force-ipv4': True,
-    'cachedir': False,
+    'cachedir': False
 }
 
 ffmpeg_options = {
@@ -36,6 +36,10 @@ ffmpeg_options = {
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
+
+# Добавляем функцию для логирования ошибок
+def log_error(error):
+    print(f"[ERROR] {datetime.now(UTC)}: {str(error)}")
 
 class MusicQueue:
     def __init__(self):
@@ -87,28 +91,46 @@ class YTDLSource(discord.PCMVolumeTransformer):
     def __init__(self, source, *, data, volume=0.5):
         super().__init__(source, volume)
         self.data = data
-        self.title = data.get('title')
-        self.url = data.get('url')
-        self.duration = data.get('duration')
-        self.thumbnail = data.get('thumbnail')
-        self.uploader = data.get('uploader')
+        self.title = data.get('title', 'Неизвестное название')
+        self.url = data.get('url', '')
+        self.duration = data.get('duration', 0)
+        self.thumbnail = data.get('thumbnail', '')
+        self.uploader = data.get('uploader', 'Неизвестный исполнитель')
 
     @classmethod
     async def from_url(cls, url, *, loop=None, stream=False):
         loop = loop or asyncio.get_event_loop()
         try:
-            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+            # Проверяем URL
+            if not url.startswith(('http://', 'https://', 'www.')):
+                raise ValueError("Неверный формат URL. Пожалуйста, предоставьте корректную ссылку на YouTube.")
+
+            # Получаем информацию о видео
+            try:
+                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+            except Exception as e:
+                log_error(f"Ошибка при получении информации о видео: {str(e)}")
+                raise Exception(f"Не удалось получить информацию о видео: {str(e)}")
 
             if 'entries' in data:
+                # Плейлист - берем первое видео
                 data = data['entries'][0]
 
+            if not data:
+                raise Exception("Не удалось получить данные о видео")
+
             filename = data['url'] if stream else ytdl.prepare_filename(data)
+            
             try:
-                return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+                source = discord.FFmpegPCMAudio(filename, **ffmpeg_options)
+                return cls(source, data=data)
             except Exception as e:
-                raise Exception(f"Ошибка FFmpeg: {str(e)}")
+                log_error(f"Ошибка FFmpeg: {str(e)}")
+                raise Exception(f"Ошибка при обработке аудио: {str(e)}")
+
         except Exception as e:
-            raise Exception(f"Ошибка при получении аудио: {str(e)}")
+            log_error(f"Общая ошибка: {str(e)}")
+            raise Exception(str(e))
 
 # Создание экземпляра бота
 intents = discord.Intents.default()
@@ -169,6 +191,14 @@ async def check_empty_voice_channel(guild):
             except Exception as e:
                 print(f"Ошибка при отключении: {e}")
 
+async def cleanup_player(voice_client):
+    try:
+        if voice_client and voice_client.is_playing():
+            voice_client.stop()
+        await asyncio.sleep(0.5)  # Даем время на корректное завершение
+    except Exception as e:
+        print(f"Ошибка при очистке плеера: {e}")
+
 @bot.event
 async def on_ready():
     print(f'{bot.user.name} подключился к Discord!')
@@ -194,17 +224,33 @@ async def on_ready():
 async def play(interaction: discord.Interaction, url: str):
     if not interaction.user.voice:
         await interaction.response.send_message(
-            '❌ Вы должны быть в голосовом канале, чтобы использовать эту команду!',
+            embed=create_music_embed(
+                "❌ Ошибка",
+                "Вы должны быть в голосовом канале!",
+                color=discord.Color.red()
+            ),
             ephemeral=True
         )
         return
 
     channel = interaction.user.voice.channel
     
-    if interaction.guild.voice_client is None:
-        await channel.connect()
-    elif interaction.guild.voice_client.channel != channel:
-        await interaction.guild.voice_client.move_to(channel)
+    try:
+        if interaction.guild.voice_client is None:
+            await channel.connect()
+        elif interaction.guild.voice_client.channel != channel:
+            await interaction.guild.voice_client.move_to(channel)
+    except Exception as e:
+        log_error(f"Ошибка при подключении к каналу: {str(e)}")
+        await interaction.response.send_message(
+            embed=create_music_embed(
+                "❌ Ошибка",
+                f"Не удалось подключиться к голосовому каналу: {str(e)}",
+                color=discord.Color.red()
+            ),
+            ephemeral=True
+        )
+        return
     
     await interaction.response.defer()
     
@@ -239,9 +285,16 @@ async def play(interaction: discord.Interaction, url: str):
             await interaction.followup.send(embed=embed)
             
     except Exception as e:
+        log_error(f"Ошибка при воспроизведении: {str(e)}")
+        error_message = str(e)
+        if "HTTP Error 429" in error_message:
+            error_message = "Слишком много запросов к YouTube. Пожалуйста, подождите немного."
+        elif "Video unavailable" in error_message:
+            error_message = "Видео недоступно. Возможно, оно приватное или было удалено."
+        
         error_embed = create_music_embed(
-            "❌ Ошибка",
-            f"Произошла ошибка при воспроизведении:\n{str(e)}",
+            "❌ Ошибка воспроизведения",
+            f"```{error_message}```\nПопробуйте другое видео или повторите попытку позже.",
             color=discord.Color.red()
         )
         await interaction.followup.send(embed=error_embed)
@@ -401,25 +454,27 @@ async def resume(interaction: discord.Interaction):
         )
         await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="stop", description="Остановить проигрывание и выйти из канала")
+@bot.tree.command(name="stop", description="Остановить воспроизведение и очистить очередь")
 async def stop(interaction: discord.Interaction):
-    if interaction.guild.voice_client:
-        queue = get_queue(interaction.guild_id)
-        await queue.clear()
-        await interaction.guild.voice_client.disconnect()
-        embed = create_music_embed(
-            "⏹️ Остановка",
-            "Воспроизведение остановлено и бот отключен от канала",
-            color=discord.Color.red()
-        )
-        await interaction.response.send_message(embed=embed)
-    else:
+    if not interaction.guild.voice_client:
         embed = create_music_embed(
             "❌ Ошибка",
-            "Бот не подключен к голосовому каналу",
+            "Бот не находится в голосовом канале",
             color=discord.Color.red()
         )
         await interaction.response.send_message(embed=embed)
+        return
+
+    await cleanup_player(interaction.guild.voice_client)
+    queue = get_queue(interaction.guild_id)
+    await queue.clear()
+    
+    embed = create_music_embed(
+        "⏹️ Остановлено",
+        "Воспроизведение остановлено и очередь очищена",
+        color=discord.Color.blue()
+    )
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="volume", description="Регулировать громкость (0-100)")
 async def volume(interaction: discord.Interaction, volume: int):
@@ -453,10 +508,10 @@ async def on_voice_state_update(member, before, after):
     if member == bot.user:
         if after.channel is None:  # Бот был отключен
             guild = before.channel.guild
+            await cleanup_player(guild.voice_client)
             queue = get_queue(guild.id)
             await queue.clear()
     elif before.channel and bot.user in before.channel.members:
-        # Проверяем канал, из которого вышел участник
         await check_empty_voice_channel(before.channel.guild)
 
 # Запуск бота
