@@ -27,14 +27,16 @@ ytdl_format_options = {
     'default_search': 'auto',
     'source_address': '0.0.0.0',
     'force-ipv4': True,
-    'cachedir': False
+    'cachedir': False,
+    'prefer_ffmpeg': True
 }
 
 ffmpeg_options = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn'
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -analyzeduration 0 -loglevel 0',
+    'options': '-vn -ar 48000 -ac 2 -f s16le'
 }
 
+# Создаем один экземпляр YoutubeDL для всего приложения
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
 
 # Добавляем функцию для логирования ошибок
@@ -98,38 +100,21 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.uploader = data.get('uploader', 'Неизвестный исполнитель')
 
     @classmethod
-    async def from_url(cls, url, *, loop=None, stream=False):
+    async def from_url(cls, url, *, loop=None, stream=True):  # Всегда используем stream=True
         loop = loop or asyncio.get_event_loop()
         try:
-            # Проверяем URL
-            if not url.startswith(('http://', 'https://', 'www.')):
-                raise ValueError("Неверный формат URL. Пожалуйста, предоставьте корректную ссылку на YouTube.")
-
-            # Получаем информацию о видео
-            try:
-                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
-                if not data:
-                    raise Exception("Не удалось получить данные о видео")
-                
-                if 'entries' in data:
-                    data = data['entries'][0]
-
-                # Получаем прямую ссылку на аудио
-                if stream:
-                    processed_data = await loop.run_in_executor(None, lambda: ytdl.extract_info(data['webpage_url'], download=False))
-                    if not processed_data:
-                        raise Exception("Не удалось получить аудиопоток")
-                    data = processed_data
-
-            except Exception as e:
-                log_error(f"Ошибка при получении информации о видео: {str(e)}")
-                raise Exception(f"Не удалось получить информацию о видео: {str(e)}")
-
-            if stream:
-                filename = data['url']
-            else:
-                filename = ytdl.prepare_filename(data)
+            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
             
+            if not data:
+                raise Exception("Не удалось получить данные о видео")
+
+            if 'entries' in data:
+                data = data['entries'][0]
+
+            # Получаем прямую ссылку на аудио
+            filename = data['url']
+            
+            # Создаем источник аудио
             try:
                 source = discord.FFmpegPCMAudio(filename, **ffmpeg_options)
                 return cls(source, data=data)
@@ -232,14 +217,18 @@ async def on_ready():
 async def safe_play(voice_client, player, after_callback):
     """Безопасное воспроизведение с предварительной остановкой."""
     try:
+        # Проверяем подключение
+        if not voice_client or not voice_client.is_connected():
+            raise Exception("Бот не подключен к голосовому каналу")
+
+        # Останавливаем текущее воспроизведение
         if voice_client.is_playing():
             voice_client.stop()
-            await asyncio.sleep(1)  # Увеличиваем время ожидания
-        
-        if not voice_client.is_connected():
-            raise Exception("Бот не подключен к голосовому каналу")
-            
+            await asyncio.sleep(1)
+
+        # Начинаем воспроизведение
         voice_client.play(player, after=after_callback)
+        
     except Exception as e:
         log_error(f"Ошибка при воспроизведении: {str(e)}")
         raise e
@@ -267,9 +256,13 @@ async def play(interaction: discord.Interaction, url: str):
             voice_client = interaction.guild.voice_client
             if voice_client.channel != interaction.user.voice.channel:
                 await voice_client.move_to(interaction.user.voice.channel)
-        
+
+        # Проверяем подключение
+        if not voice_client.is_connected():
+            voice_client = await interaction.user.voice.channel.connect()
+
         # Получение плеера
-        player = await YTDLSource.from_url(url, loop=bot.loop, stream=True)
+        player = await YTDLSource.from_url(url, loop=bot.loop)
         queue = get_queue(interaction.guild_id)
         
         if not voice_client.is_playing():
