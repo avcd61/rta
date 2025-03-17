@@ -1,16 +1,15 @@
 [tool.poetry]
-name = "discord-music-bot"
-version = "1.0.0"
-description = "Discord Music Bot with modern features"
+name = "music-bot"
+version = "0.1.0"
+description = "Музыкальный Discord бот с поддержкой Wavelink"
 authors = ["Your Name"]
 
 [tool.poetry.dependencies]
-python = "^3.12"
-discord-py = {extras = ["voice"], version = "^2.3.2"}
-python-dotenv = "^1.0.0"
+python = ">=3.9,<4.0"
+"discord.py" = "^2.0.0"
+python-dotenv = "^0.19.0"
+wavelink = "^2.6.1"
 PyNaCl = "^1.5.0"
-youtube-dl = "^2021.12.17"
-yt-dlp = "^2025.2.19"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

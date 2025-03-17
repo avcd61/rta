@@ -1,8 +1,63 @@
-run = "python bot.py"
-modules = ["python-3.12:v18-20230807-322e88b"]
+run = "python3 bot.py"
+language = "python3"
 
 [nix]
 channel = "stable-22_11"
+
+[env]
+PYTHONPATH = "$PYTHONPATH:${REPL_HOME}"
+LD_LIBRARY_PATH = "${REPL_HOME}/lib:/usr/lib"
+PATH = "${REPL_HOME}/bin:${PATH}"
+
+[packager]
+ignoredPackages = ["*"]
+
+[[packager.features]]
+packageSearch = true
+guessImports = true
+
+[unitTest]
+language = "python3"
+
+[debugger]
+support = true
+
+[debugger.interactive]
+transport = "localhost:0"
+startCommand = ["dap-python", "main.py"]
+
+[debugger.interactive.integratedAdapter]
+dapTcpAddress = "localhost:0"
+
+[debugger.interactive.initializeMessage]
+command = "initialize"
+type = "request"
+
+[debugger.interactive.initializeMessage.arguments]
+adapterID = "debugpy"
+clientID = "replit"
+clientName = "replit.com"
+columnsStartAt1 = true
+linesStartAt1 = true
+locale = "en-us"
+pathFormat = "path"
+supportsInvalidatedEvent = true
+supportsProgressReporting = true
+supportsRunInTerminalRequest = true
+supportsVariablePaging = true
+supportsVariableType = true
+
+[debugger.interactive.launchMessage]
+command = "launch"
+type = "request"
+
+[debugger.interactive.launchMessage.arguments]
+console = "externalTerminal"
+cwd = "."
+debugOptions = []
+program = "./bot.py"
+request = "launch"
+type = "python"
 
 [deployment]
 run = ["sh", "-c", "python bot.py"]
