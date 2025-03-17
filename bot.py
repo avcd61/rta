@@ -32,8 +32,8 @@ ytdl_format_options = {
 }
 
 ffmpeg_options = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -analyzeduration 0 -loglevel 0',
-    'options': '-vn -ar 48000 -ac 2 -f s16le'
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -analyzeduration 0 -loglevel error',
+    'options': '-vn -acodec pcm_s16le -ar 48000 -ac 2 -b:a 192k'
 }
 
 # Создаем один экземпляр YoutubeDL для всего приложения
