@@ -32,12 +32,14 @@ ytdl_format_options = {
     'postprocessors': [{
         'key': 'FFmpegExtractAudio',
         'preferredcodec': 'opus',
-    }]
+    }],
+    'socket_timeout': 30,
+    'retries': 10
 }
 
 ffmpeg_options = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -analyzeduration 0 -loglevel error',
-    'options': '-vn'
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -analyzeduration 0 -loglevel error -nostats',
+    'options': '-vn -c:a copy'
 }
 
 # Создаем один экземпляр YoutubeDL для всего приложения
@@ -102,31 +104,57 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.duration = data.get('duration', 0)
         self.thumbnail = data.get('thumbnail', '')
         self.uploader = data.get('uploader', 'Неизвестный исполнитель')
+        self._process = None
+        
+    def cleanup(self):
+        """Правильно освобождает ресурсы и завершает процесс"""
+        try:
+            # Освобождаем базовые ресурсы
+            super().cleanup()
+            
+            # Если есть активный процесс FFmpeg, плавно завершаем его
+            process = getattr(self.original, '_process', None)
+            if process:
+                try:
+                    process.kill()
+                    process.wait()
+                except Exception as e:
+                    log_error(f"Ошибка при завершении процесса FFmpeg: {e}")
+        except Exception as e:
+            log_error(f"Ошибка при очистке ресурсов: {e}")
 
     @classmethod
     async def from_url(cls, url, *, loop=None, stream=True):
         loop = loop or asyncio.get_event_loop()
         try:
-            # Извлекаем информацию в отдельном потоке
-            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
+            # Извлекаем информацию с более длительным таймаутом
+            data = await loop.run_in_executor(
+                None, 
+                lambda: ytdl.extract_info(url, download=not stream)
+            )
             
             if not data:
                 raise Exception("Не удалось получить данные о видео")
 
             if 'entries' in data:
-                # Плейлист - берем первый элемент
                 data = data['entries'][0]
 
-            # Получаем прямую ссылку на аудио
-            filename = data['url']
+            # Получаем URL источника
+            filename = data['url'] if stream else ytdl.prepare_filename(data)
             
-            # Создаем источник аудио с FFmpeg
-            source = discord.FFmpegPCMAudio(filename, **ffmpeg_options)
+            # Настраиваем источник аудио с улучшенными параметрами
+            source = discord.FFmpegPCMAudio(
+                filename, 
+                before_options=ffmpeg_options['before_options'],
+                options=ffmpeg_options['options']
+            )
+            
+            # Создаем и возвращаем трансформер
             return cls(source, data=data)
             
         except Exception as e:
             log_error(f"Ошибка при получении аудио: {str(e)}")
-            raise Exception(f"Не удалось воспроизвести '{url}': {str(e)}")
+            raise Exception(f"Не удалось воспроизвести: {str(e)}")
 
 # Создание экземпляра бота
 intents = discord.Intents.default()
@@ -190,8 +218,11 @@ async def check_empty_voice_channel(guild):
 async def cleanup_player(voice_client):
     try:
         if voice_client and voice_client.is_playing():
+            # Установка флага для предотвращения автоматического воспроизведения следующей песни
+            if hasattr(voice_client.source, 'cleanup'):
+                voice_client.source.cleanup()
             voice_client.stop()
-            await asyncio.sleep(0.5)  # Даем время на корректное завершение
+            await asyncio.sleep(0.5)
         if voice_client and voice_client.is_connected():
             await voice_client.disconnect()
     except Exception as e:
@@ -226,18 +257,28 @@ async def safe_play(voice_client, player, after_callback):
 
         # Останавливаем текущее воспроизведение
         if voice_client.is_playing():
+            if hasattr(voice_client.source, 'cleanup'):
+                voice_client.source.cleanup()
             voice_client.stop()
             await asyncio.sleep(0.5)
         
-        # Обёртка для callback, которая корректно обрабатывает ошибки FFmpeg
+        # Обертка для безопасного вызова callback с корректной обработкой ошибок
         def safe_callback(error):
             if error:
                 log_error(f"Ошибка FFmpeg: {str(error)}")
-            
-            # Запускаем асинхронный callback в петле asyncio
-            asyncio.run_coroutine_threadsafe(after_callback(), bot.loop)
+                
+            # Освобождаем ресурсы, если можем
+            try:
+                if hasattr(voice_client, 'source') and hasattr(voice_client.source, 'cleanup'):
+                    voice_client.source.cleanup()
+            except Exception as e:
+                log_error(f"Ошибка при очистке источника: {e}")
+                
+            # Запускаем асинхронный callback в основной петле
+            if not bot.is_closed():
+                asyncio.run_coroutine_threadsafe(after_callback(), bot.loop)
         
-        # Начинаем воспроизведение с безопасным callback
+        # Начинаем воспроизведение
         voice_client.play(player, after=safe_callback)
         
     except Exception as e:
