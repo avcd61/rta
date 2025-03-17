@@ -4,7 +4,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-import youtube_dl
+import yt_dlp
 from datetime import datetime
 import random
 from collections import deque
@@ -13,7 +13,7 @@ from collections import deque
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 
-# Настройки youtube_dl
+# Настройки yt-dlp
 ytdl_format_options = {
     'format': 'bestaudio/best',
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
@@ -26,13 +26,16 @@ ytdl_format_options = {
     'no_warnings': True,
     'default_search': 'auto',
     'source_address': '0.0.0.0',
+    'force-ipv4': True,
+    'cachedir': False,
 }
 
 ffmpeg_options = {
     'options': '-vn',
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
 }
 
-ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
+ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
 
 class MusicQueue:
     def __init__(self):
