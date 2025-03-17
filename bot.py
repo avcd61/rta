@@ -5,7 +5,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 import yt_dlp
-from datetime import datetime
+from datetime import datetime, UTC
 import random
 from collections import deque
 
@@ -31,8 +31,8 @@ ytdl_format_options = {
 }
 
 ffmpeg_options = {
-    'options': '-vn -b:a 128k',
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin'
+    'options': '-vn -b:a 128k -loglevel error -hide_banner',
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin -y'
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
@@ -43,25 +43,45 @@ class MusicQueue:
         self.current = None
         self.loop = False
         self.volume = 0.5
+        self._lock = asyncio.Lock()  # Добавляем блокировку для потокобезопасности
 
-    def add(self, track):
-        self.queue.append(track)
-        return len(self.queue) - 1
+    async def add(self, track):
+        async with self._lock:
+            self.queue.append(track)
+            return len(self.queue) - 1
 
-    def next(self):
-        if self.loop:
-            return self.current
-        if self.queue:
-            self.current = self.queue.popleft()
-            return self.current
-        return None
+    async def next(self):
+        async with self._lock:
+            if self.loop and self.current:
+                return self.current
+            if self.queue:
+                self.current = self.queue.popleft()
+                return self.current
+            self.current = None
+            return None
 
-    def shuffle(self):
-        random.shuffle(self.queue)
+    async def shuffle(self):
+        async with self._lock:
+            queue_list = list(self.queue)
+            random.shuffle(queue_list)
+            self.queue = deque(queue_list)
 
-    def clear(self):
-        self.queue.clear()
-        self.current = None
+    async def clear(self):
+        async with self._lock:
+            self.queue.clear()
+            self.current = None
+            self.loop = False
+
+    @property
+    def is_empty(self):
+        return not self.current and not self.queue
+
+    def get_queue_info(self):
+        return {
+            'current': self.current,
+            'queue_length': len(self.queue),
+            'is_looping': self.loop
+        }
 
 class YTDLSource(discord.PCMVolumeTransformer):
     def __init__(self, source, *, data, volume=0.5):
@@ -76,13 +96,19 @@ class YTDLSource(discord.PCMVolumeTransformer):
     @classmethod
     async def from_url(cls, url, *, loop=None, stream=False):
         loop = loop or asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+        try:
+            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
 
-        if 'entries' in data:
-            data = data['entries'][0]
+            if 'entries' in data:
+                data = data['entries'][0]
 
-        filename = data['url'] if stream else ytdl.prepare_filename(data)
-        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+            filename = data['url'] if stream else ytdl.prepare_filename(data)
+            try:
+                return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+            except Exception as e:
+                raise Exception(f"Ошибка FFmpeg: {str(e)}")
+        except Exception as e:
+            raise Exception(f"Ошибка при получении аудио: {str(e)}")
 
 # Создание экземпляра бота
 intents = discord.Intents.default()
@@ -102,7 +128,7 @@ def create_music_embed(title, description, color=discord.Color.blue(), thumbnail
         title=title,
         description=description,
         color=color,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(UTC)
     )
     if thumbnail:
         embed.set_thumbnail(url=thumbnail)
@@ -110,20 +136,38 @@ def create_music_embed(title, description, color=discord.Color.blue(), thumbnail
     return embed
 
 async def check_empty_voice_channel(guild):
-    if guild.voice_client and guild.voice_client.is_connected():
+    if not guild.voice_client or not guild.voice_client.is_connected():
+        return
+
+    if len(guild.voice_client.channel.members) <= 1:
+        await asyncio.sleep(300)  # Ждем 5 минут
+        
+        # Проверяем, что клиент все еще существует и подключен
+        if not guild.voice_client or not guild.voice_client.is_connected():
+            return
+            
         if len(guild.voice_client.channel.members) <= 1:
-            await asyncio.sleep(300)  # Ждем 5 минут
-            if len(guild.voice_client.channel.members) <= 1:
+            try:
                 await guild.voice_client.disconnect()
                 queue = get_queue(guild.id)
                 queue.clear()
-                channel = guild.text_channels[0]  # Отправляем сообщение в первый текстовый канал
-                embed = create_music_embed(
-                    "👋 Отключение",
-                    "Бот отключен из-за отсутствия слушателей",
-                    color=discord.Color.red()
-                )
-                await channel.send(embed=embed)
+                
+                # Найдем первый доступный текстовый канал
+                text_channel = None
+                for channel in guild.text_channels:
+                    if channel.permissions_for(guild.me).send_messages:
+                        text_channel = channel
+                        break
+                
+                if text_channel:
+                    embed = create_music_embed(
+                        "👋 Отключение",
+                        "Бот отключен из-за отсутствия слушателей",
+                        color=discord.Color.red()
+                    )
+                    await text_channel.send(embed=embed)
+            except Exception as e:
+                print(f"Ошибка при отключении: {e}")
 
 @bot.event
 async def on_ready():
@@ -183,7 +227,7 @@ async def play(interaction: discord.Interaction, url: str):
             )
             await interaction.followup.send(embed=embed)
         else:
-            position = queue.add(player)
+            position = await queue.add(player)
             embed = create_music_embed(
                 "📝 Добавлено в очередь",
                 f"**{player.title}**\n"
@@ -205,7 +249,7 @@ async def play(interaction: discord.Interaction, url: str):
 async def check_song_end(guild):
     queue = get_queue(guild.id)
     if queue.current:
-        next_song = queue.next()
+        next_song = await queue.next()
         if next_song:
             guild.voice_client.play(next_song, after=lambda e: asyncio.run_coroutine_threadsafe(
                 check_song_end(guild), bot.loop
@@ -229,7 +273,7 @@ async def check_song_end(guild):
 async def queue(interaction: discord.Interaction):
     queue = get_queue(interaction.guild_id)
     
-    if not queue.current and not queue.queue:
+    if queue.is_empty:
         embed = create_music_embed(
             "📋 Очередь пуста",
             "Нет треков в очереди",
@@ -279,7 +323,7 @@ async def skip(interaction: discord.Interaction):
 async def shuffle(interaction: discord.Interaction):
     queue = get_queue(interaction.guild_id)
     
-    if not queue.queue:
+    if queue.is_empty:
         embed = create_music_embed(
             "❌ Ошибка",
             "Очередь пуста",
@@ -288,7 +332,7 @@ async def shuffle(interaction: discord.Interaction):
         await interaction.response.send_message(embed=embed)
         return
     
-    queue.shuffle()
+    await queue.shuffle()
     embed = create_music_embed(
         "🔀 Перемешивание",
         "Очередь перемешана",
@@ -312,7 +356,7 @@ async def loop(interaction: discord.Interaction):
 @bot.tree.command(name="clear", description="Очистить очередь")
 async def clear(interaction: discord.Interaction):
     queue = get_queue(interaction.guild_id)
-    queue.clear()
+    await queue.clear()
     
     embed = create_music_embed(
         "🗑️ Очистка",
@@ -361,7 +405,7 @@ async def resume(interaction: discord.Interaction):
 async def stop(interaction: discord.Interaction):
     if interaction.guild.voice_client:
         queue = get_queue(interaction.guild_id)
-        queue.clear()
+        await queue.clear()
         await interaction.guild.voice_client.disconnect()
         embed = create_music_embed(
             "⏹️ Остановка",
@@ -403,6 +447,17 @@ async def volume(interaction: discord.Interaction, volume: int):
         color=discord.Color.blue()
     )
     await interaction.response.send_message(embed=embed)
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member == bot.user:
+        if after.channel is None:  # Бот был отключен
+            guild = before.channel.guild
+            queue = get_queue(guild.id)
+            await queue.clear()
+    elif before.channel and bot.user in before.channel.members:
+        # Проверяем канал, из которого вышел участник
+        await check_empty_voice_channel(before.channel.guild)
 
 # Запуск бота
 bot.run(TOKEN) 
