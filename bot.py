@@ -38,8 +38,8 @@ ytdl_format_options = {
 }
 
 ffmpeg_options = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -analyzeduration 0 -loglevel error -nostats',
-    'options': '-vn -c:a copy'
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -analyzeduration 0 -loglevel error',
+    'options': '-vn -acodec libopus -b:a 128k -ar 48000 -ac 2'
 }
 
 # Создаем один экземпляр YoutubeDL для всего приложения
@@ -109,19 +109,35 @@ class YTDLSource(discord.PCMVolumeTransformer):
     def cleanup(self):
         """Правильно освобождает ресурсы и завершает процесс"""
         try:
-            # Освобождаем базовые ресурсы
-            super().cleanup()
-            
-            # Если есть активный процесс FFmpeg, плавно завершаем его
+            # Закрываем источник аудио
+            if hasattr(self, 'original') and hasattr(self.original, '_buffer'):
+                try:
+                    self.original._buffer.close()
+                except:
+                    pass
+                
+            # Проверяем и завершаем процесс FFmpeg
             process = getattr(self.original, '_process', None)
             if process:
                 try:
-                    process.kill()
-                    process.wait()
-                except Exception as e:
-                    log_error(f"Ошибка при завершении процесса FFmpeg: {e}")
+                    # Вместо kill(), который может вызвать SIGKILL,
+                    # используем более мягкий способ завершения
+                    import signal
+                    process.send_signal(signal.SIGTERM)
+                    process.wait(timeout=2)
+                except:
+                    try:
+                        process.kill()
+                    except:
+                        pass
+                    
+            # Вызываем родительский метод cleanup
+            try:
+                super().cleanup()
+            except:
+                pass
         except Exception as e:
-            log_error(f"Ошибка при очистке ресурсов: {e}")
+            log_error(f"Ошибка при очистке ресурсов YTDLSource: {e}")
 
     @classmethod
     async def from_url(cls, url, *, loop=None, stream=True):
@@ -250,33 +266,41 @@ async def on_ready():
         print(f"Ошибка синхронизации команд: {e}")
 
 async def safe_play(voice_client, player, after_callback):
-    """Безопасное воспроизведение с корректной обработкой ошибок."""
+    """Безопасное воспроизведение с корректной обработкой ошибок и ресурсов."""
     try:
         if not voice_client or not voice_client.is_connected():
             raise Exception("Бот не подключен к голосовому каналу")
 
         # Останавливаем текущее воспроизведение
         if voice_client.is_playing():
+            # Сначала корректно освобождаем ресурсы текущего источника
             if hasattr(voice_client.source, 'cleanup'):
                 voice_client.source.cleanup()
+            # Только потом останавливаем
             voice_client.stop()
-            await asyncio.sleep(0.5)
+            # Ждем чтобы быть уверенными что все ресурсы освобождены
+            await asyncio.sleep(1)
         
         # Обертка для безопасного вызова callback с корректной обработкой ошибок
         def safe_callback(error):
             if error:
-                log_error(f"Ошибка FFmpeg: {str(error)}")
+                log_error(f"FFmpeg завершился с ошибкой: {str(error)}")
                 
-            # Освобождаем ресурсы, если можем
+            # Освобождаем ресурсы перед вызовом следующего callback
             try:
                 if hasattr(voice_client, 'source') and hasattr(voice_client.source, 'cleanup'):
                     voice_client.source.cleanup()
             except Exception as e:
-                log_error(f"Ошибка при очистке источника: {e}")
+                log_error(f"Ошибка при очистке источника в callback: {e}")
                 
-            # Запускаем асинхронный callback в основной петле
+            # Запускаем асинхронный callback только если бот активен
             if not bot.is_closed():
-                asyncio.run_coroutine_threadsafe(after_callback(), bot.loop)
+                future = asyncio.run_coroutine_threadsafe(after_callback(), bot.loop)
+                try:
+                    # Добавляем таймаут для предотвращения зависания
+                    future.result(timeout=60)
+                except Exception as e:
+                    log_error(f"Ошибка в callback после воспроизведения: {e}")
         
         # Начинаем воспроизведение
         voice_client.play(player, after=safe_callback)
