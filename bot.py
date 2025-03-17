@@ -15,7 +15,7 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 
 # Настройки yt-dlp
 ytdl_format_options = {
-    'format': 'bestaudio',
+    'format': 'bestaudio/best',
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
     'restrictfilenames': True,
     'noplaylist': True,
@@ -28,12 +28,16 @@ ytdl_format_options = {
     'source_address': '0.0.0.0',
     'force-ipv4': True,
     'cachedir': False,
-    'prefer_ffmpeg': True
+    'prefer_ffmpeg': True,
+    'postprocessors': [{
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': 'opus',
+    }]
 }
 
 ffmpeg_options = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -analyzeduration 0 -loglevel error',
-    'options': '-vn -acodec pcm_s16le -ar 48000 -ac 2 -b:a 192k'
+    'options': '-vn'
 }
 
 # Создаем один экземпляр YoutubeDL для всего приложения
@@ -100,31 +104,29 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.uploader = data.get('uploader', 'Неизвестный исполнитель')
 
     @classmethod
-    async def from_url(cls, url, *, loop=None, stream=True):  # Всегда используем stream=True
+    async def from_url(cls, url, *, loop=None, stream=True):
         loop = loop or asyncio.get_event_loop()
         try:
+            # Извлекаем информацию в отдельном потоке
             data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
             
             if not data:
                 raise Exception("Не удалось получить данные о видео")
 
             if 'entries' in data:
+                # Плейлист - берем первый элемент
                 data = data['entries'][0]
 
             # Получаем прямую ссылку на аудио
             filename = data['url']
             
-            # Создаем источник аудио
-            try:
-                source = discord.FFmpegPCMAudio(filename, **ffmpeg_options)
-                return cls(source, data=data)
-            except Exception as e:
-                log_error(f"Ошибка FFmpeg: {str(e)}")
-                raise Exception(f"Ошибка при обработке аудио: {str(e)}")
-
+            # Создаем источник аудио с FFmpeg
+            source = discord.FFmpegPCMAudio(filename, **ffmpeg_options)
+            return cls(source, data=data)
+            
         except Exception as e:
-            log_error(f"Общая ошибка: {str(e)}")
-            raise Exception(str(e))
+            log_error(f"Ошибка при получении аудио: {str(e)}")
+            raise Exception(f"Не удалось воспроизвести '{url}': {str(e)}")
 
 # Создание экземпляра бота
 intents = discord.Intents.default()
@@ -189,9 +191,11 @@ async def cleanup_player(voice_client):
     try:
         if voice_client and voice_client.is_playing():
             voice_client.stop()
-        await asyncio.sleep(0.5)  # Даем время на корректное завершение
+            await asyncio.sleep(0.5)  # Даем время на корректное завершение
+        if voice_client and voice_client.is_connected():
+            await voice_client.disconnect()
     except Exception as e:
-        print(f"Ошибка при очистке плеера: {e}")
+        log_error(f"Ошибка при очистке плеера: {e}")
 
 @bot.event
 async def on_ready():
@@ -215,19 +219,26 @@ async def on_ready():
         print(f"Ошибка синхронизации команд: {e}")
 
 async def safe_play(voice_client, player, after_callback):
-    """Безопасное воспроизведение с предварительной остановкой."""
+    """Безопасное воспроизведение с корректной обработкой ошибок."""
     try:
-        # Проверяем подключение
         if not voice_client or not voice_client.is_connected():
             raise Exception("Бот не подключен к голосовому каналу")
 
         # Останавливаем текущее воспроизведение
         if voice_client.is_playing():
             voice_client.stop()
-            await asyncio.sleep(1)
-
-        # Начинаем воспроизведение
-        voice_client.play(player, after=after_callback)
+            await asyncio.sleep(0.5)
+        
+        # Обёртка для callback, которая корректно обрабатывает ошибки FFmpeg
+        def safe_callback(error):
+            if error:
+                log_error(f"Ошибка FFmpeg: {str(error)}")
+            
+            # Запускаем асинхронный callback в петле asyncio
+            asyncio.run_coroutine_threadsafe(after_callback(), bot.loop)
+        
+        # Начинаем воспроизведение с безопасным callback
+        voice_client.play(player, after=safe_callback)
         
     except Exception as e:
         log_error(f"Ошибка при воспроизведении: {str(e)}")
@@ -257,20 +268,18 @@ async def play(interaction: discord.Interaction, url: str):
             if voice_client.channel != interaction.user.voice.channel:
                 await voice_client.move_to(interaction.user.voice.channel)
 
-        # Проверяем подключение
-        if not voice_client.is_connected():
-            voice_client = await interaction.user.voice.channel.connect()
-
-        # Получение плеера
-        player = await YTDLSource.from_url(url, loop=bot.loop)
+        # Получение плеера и настройка громкости
         queue = get_queue(interaction.guild_id)
+        player = await YTDLSource.from_url(url, loop=bot.loop)
+        player.volume = queue.volume
+        
+        # Определяем асинхронную функцию для обработки завершения песни
+        async def song_finished():
+            await check_song_end(interaction.guild)
         
         if not voice_client.is_playing():
-            await safe_play(
-                voice_client, 
-                player, 
-                lambda e: asyncio.run_coroutine_threadsafe(check_song_end(interaction.guild), bot.loop)
-            )
+            # Воспроизводим первую песню
+            await safe_play(voice_client, player, song_finished)
             queue.current = player
             
             embed = create_music_embed(
@@ -282,6 +291,7 @@ async def play(interaction: discord.Interaction, url: str):
             )
             await interaction.followup.send(embed=embed)
         else:
+            # Добавляем в очередь
             position = await queue.add(player)
             embed = create_music_embed(
                 "📝 Добавлено в очередь",
@@ -309,27 +319,47 @@ async def play(interaction: discord.Interaction, url: str):
         await interaction.followup.send(embed=error_embed)
 
 async def check_song_end(guild):
-    queue = get_queue(guild.id)
-    if queue.current:
+    try:
+        queue = get_queue(guild.id)
+        
+        # Получаем следующую песню из очереди
         next_song = await queue.next()
+        
+        # Проверяем, что у нас есть голосовой клиент и он подключен
+        if not guild.voice_client or not guild.voice_client.is_connected():
+            return
+            
         if next_song:
-            guild.voice_client.play(next_song, after=lambda e: asyncio.run_coroutine_threadsafe(
-                check_song_end(guild), bot.loop
-            ))
-            queue.current = next_song
-            channel = guild.text_channels[0]
-            embed = create_music_embed(
-                "🎵 Следующий трек",
-                f"**{next_song.title}**\n"
-                f"👤 Исполнитель: {next_song.uploader}\n"
-                f"⏱️ Длительность: {next_song.duration//60}:{next_song.duration%60:02d}",
-                thumbnail=next_song.thumbnail
-            )
-            await channel.send(embed=embed)
+            # Определяем callback для следующей песни
+            async def next_song_finished():
+                await check_song_end(guild)
+                
+            # Воспроизводим следующую песню
+            await safe_play(guild.voice_client, next_song, next_song_finished)
+            
+            # Находим подходящий текстовый канал для уведомления
+            channel = None
+            for ch in guild.text_channels:
+                if ch.permissions_for(guild.me).send_messages:
+                    channel = ch
+                    break
+            
+            if channel:
+                embed = create_music_embed(
+                    "🎵 Следующий трек",
+                    f"**{next_song.title}**\n"
+                    f"👤 Исполнитель: {next_song.uploader}\n"
+                    f"⏱️ Длительность: {next_song.duration//60}:{next_song.duration%60:02d}",
+                    thumbnail=next_song.thumbnail
+                )
+                await channel.send(embed=embed)
         else:
+            # Очередь пуста
             queue.current = None
             await asyncio.sleep(1)
             await check_empty_voice_channel(guild)
+    except Exception as e:
+        log_error(f"Ошибка при обработке конца песни: {str(e)}")
 
 @bot.tree.command(name="queue", description="Показать текущую очередь воспроизведения")
 async def queue(interaction: discord.Interaction):
