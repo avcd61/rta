@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "discord-music-bot"
+version = "1.0.0"
+description = "Discord Music Bot with modern features"
+authors = ["Your Name"]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+discord-py = {extras = ["voice"], version = "^2.3.2"}
+python-dotenv = "^1.0.0"
+PyNaCl = "^1.5.0"
+youtube-dl = "^2021.12.17"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api" 
